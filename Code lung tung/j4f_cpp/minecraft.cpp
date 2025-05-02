@@ -1,5 +1,3 @@
-// Based on a 3D raycasting example I studied, modified for terminal input and color output.
-
 #include <fcntl.h>
 #include <windows.h>
 #include <conio.h>
@@ -9,6 +7,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+
 #define Y_PIXELS 180
 #define X_PIXELS 900
 #define Z_BLOCKS 10
@@ -18,26 +22,85 @@
 #define VIEW_HEIGHT 0.7
 #define VIEW_WIDTH 1
 #define BLOCK_BORDER_SIZE 0.05
+#define NUM_THREADS 8  // Number of threads to use for ray calculations
 
 HANDLE hConsole;
 CONSOLE_CURSOR_INFO oldCursorInfo;
 DWORD oldConsoleMode;
+std::mutex pictureMutex;  // Mutex for thread-safe access to the picture array
 
 typedef struct Vector {
     float x;
     float y;
     float z;
 } vect;
+
 typedef struct Vector2 {
     float psi;
     float phi;
 } vect2;
 
-
 typedef struct Vector_vector2 {
     vect pos;
     vect2 view;
 } player_pos_view;
+
+// Thread pool implementation
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::vector<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    std::atomic<bool> stop;
+
+public:
+    ThreadPool(size_t threads) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] { 
+                            return this->stop || !this->tasks.empty(); 
+                        });
+                        
+                        if (this->stop && this->tasks.empty()) {
+                            return;
+                        }
+                        
+                        task = std::move(this->tasks.back());
+                        this->tasks.pop_back();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            tasks.emplace_back(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        
+        condition.notify_all();
+        
+        for (std::thread &worker : workers) {
+            worker.join();
+        }
+    }
+};
 
 void init_terminal()
 {
@@ -71,6 +134,7 @@ void restore_terminal()
 
     std::cout << "terminal restored" << std::endl;
 }
+
 static char keystate[256] = { 0 };
 
 void process_input()
@@ -81,7 +145,6 @@ void process_input()
     while (_kbhit())
     {
         char c = _getch();
-        std::cout << "input: " << c << std::endl;
         unsigned char key = (unsigned char)c;
         keystate[key] = 1; // Mark key as pressed
         if (c == 'q')
@@ -99,6 +162,7 @@ char** init_picture() {
     char** picture = (char**)malloc(sizeof(char*) * Y_PIXELS);
     for (int i = 0; i < Y_PIXELS; i++) {
         picture[i] = (char*)malloc(sizeof(char) * X_PIXELS);
+        memset(picture[i], ' ', X_PIXELS); // Initialize with spaces
     }
     return picture;
 }
@@ -126,6 +190,7 @@ player_pos_view init_posview() {
     posview.view.psi = 0;
     return posview;
 }
+
 vect angles_to_vect(vect2 angles) {
     vect res;
     res.x = cos(angles.psi) * cos(angles.phi);
@@ -133,6 +198,7 @@ vect angles_to_vect(vect2 angles) {
     res.z = sin(angles.psi);
     return res;
 }
+
 vect vect_add(vect v1, vect v2) {
     vect res;
     res.x = v1.x + v2.x;
@@ -150,6 +216,7 @@ vect vect_sub(vect v1, vect v2) {
     vect v3 = vect_scale(-1, v2);
     return vect_add(v1, v3);
 }
+
 void vect_normalize(vect* v) {
     float len = sqrt(v->x * v->x + v->y * v->y + v->z * v->z);
     v->x /= len;
@@ -215,12 +282,6 @@ int on_block_border(vect pos) {
     return 0;
 }
 
-// float min(float a, float b) {
-//     if (a < b)
-//         return a;
-//     return b;
-// }
-
 char raytrace(vect pos, vect dir, char*** blocks) {
     float eps = 0.01;
     while (!ray_outside(pos)) {
@@ -257,13 +318,47 @@ char raytrace(vect pos, vect dir, char*** blocks) {
     return ' ';
 }
 
-char** get_picture(char** picture, player_pos_view posview, char*** blocks) {
-    vect** directions = init_directions(posview.view);
-    for (int y = 0; y < Y_PIXELS; y++) {
-        for (int x = 0; x < X_PIXELS; x++) {
-            picture[y][x] = raytrace(posview.pos, directions[y][x], blocks);
+// Function to render a chunk of the picture (used by worker threads)
+void render_chunk(int start_y, int end_y, int start_x, int end_x, 
+                  char** picture, vect** directions, 
+                  player_pos_view posview, char*** blocks) {
+    for (int y = start_y; y < end_y; y++) {
+        for (int x = start_x; x < end_x; x++) {
+            char pixel = raytrace(posview.pos, directions[y][x], blocks);
+            
+            // Thread-safe update to the picture array
+            std::lock_guard<std::mutex> lock(pictureMutex);
+            picture[y][x] = pixel;
         }
     }
+}
+
+void get_picture_multithreaded(char** picture, player_pos_view posview, char*** blocks) {
+    vect** directions = init_directions(posview.view);
+    
+    // Create thread pool
+    ThreadPool pool(NUM_THREADS);
+    
+    // Calculate the size of chunks for each thread
+    int chunk_height = Y_PIXELS / NUM_THREADS;
+    
+    // Submit tasks to thread pool
+    for (int i = 0; i < NUM_THREADS; i++) {
+        int start_y = i * chunk_height;
+        int end_y = (i == NUM_THREADS - 1) ? Y_PIXELS : (i + 1) * chunk_height;
+        
+        pool.enqueue([start_y, end_y, picture, directions, posview, blocks]() {
+            render_chunk(start_y, end_y, 0, X_PIXELS, picture, directions, posview, blocks);
+        });
+    }
+    
+    // Pool destructor will wait for all tasks to complete
+    
+    // Free directions array
+    for (int i = 0; i < Y_PIXELS; i++) {
+        free(directions[i]);
+    }
+    free(directions);
 }
 
 void draw_ascii(char** picture) {
@@ -272,7 +367,6 @@ void draw_ascii(char** picture) {
     for (int i = 0; i < Y_PIXELS; i++) {
         int current_color = 0;
         for (int j = 0; j < X_PIXELS; j++) {
-            // printf("%c", picture[i][j]);
             if (picture[i][j] == 'o' && current_color != 32) {
                 printf("\x1B[32m");
                 current_color = 32;
@@ -299,7 +393,6 @@ void update_pos_view(player_pos_view* posview, char*** blocks) {
     if (blocks[z][y][x] == ' ') {
         posview->pos.z -= 1;
     }
-
 
     if (is_key_pressed('w')) {
         posview->view.psi += tilt_eps;
@@ -376,7 +469,7 @@ void place_block(vect pos, char*** blocks, char block) {
     dists[5] = fabsf(pos.z - z);
     int min = 0;
     float mindist = dists[0];
-    for (int i = 0; i < 6;i++) {
+    for (int i = 0; i < 6; i++) {
         if (dists[i] < mindist) {
             mindist = dists[i];
             min = i;
@@ -410,6 +503,8 @@ int main() {
     init_terminal();
     char** picture = init_picture();
     char*** blocks = init_blocks();
+    
+    // Create ground level
     for (int x = 0; x < X_BLOCKS; x++) {
         for (int y = 0; y < Y_BLOCKS; y++) {
             for (int z = 0; z < 4; z++) {
@@ -417,13 +512,24 @@ int main() {
             }
         }
     }
+    
     player_pos_view posview = init_posview();
+    
+    // Display performance info
+    std::cout << "Multithreaded raycasting engine using " << NUM_THREADS << " threads" << std::endl;
+    
+    // Main game loop
     while (1) {
+        // Process keyboard input
         process_input();
         if (is_key_pressed('q')) {
-            exit(0);
+            break;
         }
+        
+        // Update player position and view
         update_pos_view(&posview, blocks);
+        
+        // Handle block interaction
         vect current_block = get_current_block(posview, blocks);
         int have_current_block = !ray_outside(current_block);
         int current_block_x = current_block.x;
@@ -431,26 +537,54 @@ int main() {
         int current_block_z = current_block.z;
         char current_block_c;
         int removed = 0;
+        
         if (have_current_block) {
             current_block_c = blocks[current_block_z][current_block_y][current_block_x];
             blocks[current_block_z][current_block_y][current_block_x] = 'o';
+            
+            // Remove block with 'x' key
             if (is_key_pressed('x')) {
                 removed = 1;
                 blocks[current_block_z][current_block_y][current_block_x] = ' ';
             }
 
+            // Place block with space key
             if (is_key_pressed(' ')) {
                 place_block(current_block, blocks, '@');
             }
         }
 
-        get_picture(picture, posview, blocks);
+        // Render the scene using multithreading
+        get_picture_multithreaded(picture, posview, blocks);
+        
+        // Restore the highlighted block
         if (have_current_block && !removed) {
             blocks[current_block_z][current_block_y][current_block_x] = current_block_c;
         }
+        
+        // Draw the scene
         draw_ascii(picture);
+        
+        // Small delay to limit frame rate
         Sleep(20);
     }
+    
+    // Clean up
     restore_terminal();
+    
+    // Free memory
+    for (int i = 0; i < Y_PIXELS; i++) {
+        free(picture[i]);
+    }
+    free(picture);
+    
+    for (int i = 0; i < Z_BLOCKS; i++) {
+        for (int j = 0; j < Y_BLOCKS; j++) {
+            free(blocks[i][j]);
+        }
+        free(blocks[i]);
+    }
+    free(blocks);
+    
     return 0;
 }
