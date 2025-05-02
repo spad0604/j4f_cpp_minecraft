@@ -7,6 +7,8 @@
 #include <string.h>
 #include <math.h>
 
+using namespace std;
+
 #define X_PIXELS 400
 #define Y_PIXELS 200
 
@@ -14,10 +16,10 @@
 #define Y_BLOCK 20
 #define Z_BLOCK 10
 
-#define VIEW_HEIGH 0.5
-#define VIEW_WIDTH 0.5
+#define VIEW_HEIGH 0.7
+#define VIEW_WIDTH 1
 
-#define BLOCK_BORDER_SIZE 0.5
+#define BLOCK_BORDER_SIZE 0.05
 
 typedef struct Vector
 {
@@ -72,7 +74,7 @@ void restore_terminal()
     HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
     SetConsoleMode(hInput, oldConsoleMode);
 
-    std::cout << "terminal restored" << std::endl;
+    cout << "terminal restored" << endl;
 }
 
 static char keystate[256] = {0}; // Array to store key states
@@ -85,7 +87,7 @@ void process_input()
     while (_kbhit())
     {
         char c = _getch();
-        std::cout << "input: " << c << std::endl;
+        cout << "input: " << c << endl;
         unsigned char key = (unsigned char)c;
         keystate[key] = 1; // Mark key as pressed
         if (c == 'q')
@@ -151,20 +153,16 @@ vect vect_add(vect v1, vect v2) // Add two vectors
     return sum_vect;
 }
 
-vect vect_sub(vect v1, vect v2) // Subtract two vectors
-{
-    vect sub_vect;
-    sub_vect.x = v1.x - v2.x;
-    sub_vect.y = v1.y - v2.y;
-    sub_vect.z = v1.z - v2.z;
-
-    return sub_vect;
-}
-
 vect vect_scale(float scale, vect v) // Multiply a vector by a scalar
 {
     vect res = {scale * v.x, scale * v.y, scale * v.z};
     return res;
+}
+
+vect vect_sub(vect v1, vect v2)
+{
+    vect v3 = vect_scale(-1, v2);
+    return vect_add(v1, v3);
 }
 
 void vect_normalize(vect *v)
@@ -221,23 +219,18 @@ int ray_outside(vect pos)
     return 0;
 }
 
-int on_block_border(vect pos)
-{
+int on_block_border(vect pos) {
     int cnt = 0;
-    if (fabsf(pos.x - roundf(pos.x)) < BLOCK_BORDER_SIZE)
-    {
+    if (fabsf(pos.x - roundf(pos.x)) < BLOCK_BORDER_SIZE) {
         cnt++;
     }
-    if (fabsf(pos.y - roundf(pos.y)) < BLOCK_BORDER_SIZE)
-    {
+    if (fabsf(pos.y - roundf(pos.y)) < BLOCK_BORDER_SIZE) {
         cnt++;
     }
-    if (fabsf(pos.z - roundf(pos.z)) < BLOCK_BORDER_SIZE)
-    {
+    if (fabsf(pos.z - roundf(pos.z)) < BLOCK_BORDER_SIZE) {
         cnt++;
     }
-    if (cnt >= 2)
-    {
+    if (cnt >= 2) {
         return 1;
     }
     return 0;
@@ -253,7 +246,7 @@ char raytrace(vect pos, vect dir, char ***blocks)
         {
             if (on_block_border(pos))
             {
-                return '@';
+                return '-';
             }
             else
             {
@@ -263,66 +256,74 @@ char raytrace(vect pos, vect dir, char ***blocks)
         float dist = 2;
         if (dir.x > eps)
         {
-            dist = std::min(dist, ((int)(pos.x + 1) - pos.x) / dir.x);
+            dist = min(dist, ((int)(pos.x + 1) - pos.x) / dir.x);
         }
         else if (dir.x < -eps)
         {
-            dist = std::min(dist, ((int)pos.x - pos.x) / dir.x);
+            dist = min(dist, ((int)pos.x - pos.x) / dir.x);
         }
         if (dir.y > eps)
         {
-            dist = std::min(dist, ((int)(pos.y + 1) - pos.y) / dir.y);
+            dist = min(dist, ((int)(pos.y + 1) - pos.y) / dir.y);
         }
         else if (dir.y < -eps)
         {
-            dist = std::min(dist, ((int)pos.y - pos.y) / dir.y);
+            dist = min(dist, ((int)pos.y - pos.y) / dir.y);
         }
         if (dir.z > eps)
         {
-            dist = std::min(dist, ((int)(pos.z + 1) - pos.z) / dir.z);
+            dist = min(dist, ((int)(pos.z + 1) - pos.z) / dir.z);
         }
         else if (dir.z < -eps)
         {
-            dist = std::min(dist, ((int)pos.z - pos.z) / dir.z);
+            dist = min(dist, ((int)pos.z - pos.z) / dir.z);
         }
         pos = vect_add(pos, vect_scale(dist + eps, dir));
     }
     return ' ';
 }
 
-void get_picture(char **picture, player_pos_view posview, char ***blocks)
-{
-    vect **directions = init_directions(posview.view);
-
-    for (int y = 0; y < Y_PIXELS; y++)
-    {
-        for (int x = 0; x < X_PIXELS; x++)
-        {
+char** get_picture(char** picture, player_pos_view posview, char*** blocks) {
+    vect** directions = init_directions(posview.view);
+    for (int y = 0; y < Y_PIXELS; y++) {
+        for (int x = 0; x < X_PIXELS; x++) {
             picture[y][x] = raytrace(posview.pos, directions[y][x], blocks);
         }
     }
-
-    // Free memory
-    for (int i = 0; i < Y_PIXELS; i++)
-    {
-        free(directions[i]);
-    }
-    free(directions);
 }
 
-void draw_ascii(char **picture)
-{
-    // Move cursor to top-left corner
-    COORD cursorPosition = {0, 0};
-    SetConsoleCursorPosition(hConsole, cursorPosition);
+void update_pos_view(player_pos_view* player, char*** block) {
+    float move_eps = 0.30;
+    float tilt_eps = 0.01;
+    if(is_key_pressed('w')) {
+        player -> view.psi += tilt_eps;
+    } else if(is_key_pressed('s')) {
+        player -> view.psi -= tilt_eps;
+    } else if(is_key_pressed('a')) {
+        player -> view.phi -= move_eps;
+    } else if(is_key_pressed('d')) {
+        player -> view.phi += move_eps;
+    }
+}
 
-    for (int i = 0; i < Y_PIXELS; i++)
-    {
-        for (int j = 0; j < X_PIXELS; j++)
-        {
-            std::cout << picture[i][j];
+void draw_ascii(char** picture) {
+    fflush(stdout);
+    printf("\033[0;0H");
+    for (int i = 0; i < Y_PIXELS; i++) {
+        int current_color = 0;
+        for (int j = 0; j < X_PIXELS; j++) {
+            // printf("%c", picture[i][j]);
+            if (picture[i][j] == 'o' && current_color != 32) {
+                printf("\x1B[32m");
+                current_color = 32;
+            }
+            else if (picture[i][j] != 'o' && current_color != 0) {
+                printf("\x1B[0m");
+                current_color = 0;
+            }
+            printf("%c", picture[i][j]);
         }
-        std::cout << std::endl;
+        printf("\x1B[0m\n");
     }
 }
 
@@ -351,7 +352,7 @@ int main()
     {
         for (int y = 0; y < Y_BLOCK; y++)
         {
-            for (int z = 0; z < Z_BLOCK; z++)
+            for (int z = 0; z < 4; z++)
             {
                 blocks[z][y][x] = '@';
             }
@@ -369,6 +370,8 @@ int main()
         {
             exit(0);
         }
+
+        update_pos_view(&posview, blocks);
 
         get_picture(picture, posview, blocks);
         draw_ascii(picture);
